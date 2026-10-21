@@ -1,0 +1,298 @@
+# ---------------------------------------------------------------------------
+# Tests for map_records().
+#
+# map_records() reads everything from `native_detected_coord`, the spatial
+# output of detect_native_coord(), which carries the record columns as well as
+# the classification and validated coordinates for every record. Inputs with
+# missing coordinates (e.g. the output of detect_native_country()) are
+# rejected.
+#
+# The installed mapview stores only the point geometry in the returned
+# object's @object slot (an sfc_POINT, no attribute table), so deduplication
+# behaviour is asserted through the coordinates and count of the rendered
+# points. If mapview changes its return structure, pts_of() must be revisited.
+# ---------------------------------------------------------------------------
+
+# --- Helpers ----------------------------------------------------------------
+
+# A nativeDetected table as detect_native_coord() returns it: the record
+# columns plus the classification columns.
+mk_native_detected_coord <- function(
+  gbifID,
+  native_status,
+  name = "Sp alpha",
+  lon = 10,
+  lat = 60,
+  source = "exact"
+) {
+  n <- length(gbifID)
+  out <- data.table(
+    gbifID = gbifID,
+    gbif_issues = rep("", n),
+    Accepted_name = rep_len(name, n),
+    scientificName = rep_len(name, n),
+    Taxonomic_status = rep("accepted", n),
+    order = rep("Fagales", n),
+    family = rep("Betulaceae", n),
+    basisOfRecord = rep("HUMAN_OBSERVATION", n),
+    decimalLongitude = rep_len(lon, n),
+    decimalLatitude = rep_len(lat, n),
+    native_status = native_status,
+    native_status_source = rep_len(source, n)
+  )
+  class(out) <- c("nativeDetected", class(out))
+  out
+}
+
+# Point coordinates rendered by mapview, sorted for order-independent
+# comparisons.
+pts_of <- function(map) {
+  coords <- sf::st_coordinates(map@object[[1]])
+  coords <- as.data.frame(coords)
+  coords <- coords[order(coords$X, coords$Y), , drop = FALSE]
+  rownames(coords) <- NULL
+  coords
+}
+
+build_map <- function(nd, precision = 3, species = "all") {
+  suppressMessages(map_records(
+    native_detected_coord = nd,
+    species = species,
+    precision = precision,
+    cex = 3
+  ))
+}
+
+# --- Signature validation ---------------------------------------------------
+
+test_that("default (missing) inputs error with a clear message", {
+  expect_error(
+    map_records(),
+    '`native_detected_coord` must be a "nativeDetected" object'
+  )
+})
+
+test_that("native_detected_coord must be a nativeDetected object", {
+  expect_error(
+    map_records(native_detected_coord = iris),
+    '`native_detected_coord` must be a "nativeDetected" object'
+  )
+})
+
+test_that("native_detected_coord must carry every required column", {
+  required <- c(
+    "gbifID",
+    "native_status",
+    "native_status_source",
+    "gbif_issues",
+    "Accepted_name",
+    "scientificName",
+    "Taxonomic_status",
+    "order",
+    "family",
+    "basisOfRecord",
+    "decimalLatitude",
+    "decimalLongitude"
+  )
+  for (col in required) {
+    nd <- mk_native_detected_coord("1", "native")
+    nd[[col]] <- NULL
+    expect_error(
+      map_records(native_detected_coord = nd),
+      paste0("missing required column\\(s\\): ", col),
+      info = col
+    )
+  }
+})
+
+test_that("records with missing coordinates are rejected", {
+  # The output of detect_native_country() carries the coordinate columns but
+  # all values are missing; that is exactly what this check must catch.
+  nd <- mk_native_detected_coord(c("1", "2"), rep("native", 2))
+  nd[1, `:=`(decimalLongitude = NA_real_, decimalLatitude = NA_real_)]
+
+  expect_error(
+    map_records(native_detected_coord = nd),
+    "1 record\\(s\\) with missing coordinates"
+  )
+})
+
+test_that("precision must be a single positive integer", {
+  nd <- mk_native_detected_coord("1", "native")
+  for (bad in list(0, -1, 2.5, NA_real_, "3", c(3, 4))) {
+    expect_error(
+      map_records(native_detected_coord = nd, precision = bad),
+      "`precision` must be a single positive integer",
+      info = paste(deparse(bad), collapse = "")
+    )
+  }
+})
+
+test_that("cex must be a single positive number", {
+  nd <- mk_native_detected_coord("1", "native")
+  for (bad in list(0, -1, NA_real_, "3", c(3, 3))) {
+    expect_error(
+      map_records(native_detected_coord = nd, cex = bad),
+      "`cex` must be a single positive number",
+      info = paste(deparse(bad), collapse = "")
+    )
+  }
+})
+
+test_that("species must be a single name, or 'all'", {
+  nd <- mk_native_detected_coord("1", "native")
+  for (bad in list(NA_character_, 1, c("a", "b"))) {
+    expect_error(
+      map_records(native_detected_coord = nd, species = bad),
+      '`species` must be a single species name, or "all"',
+      info = paste(deparse(bad), collapse = "")
+    )
+  }
+})
+
+# --- Deduplication and record selection ------------------------------------
+
+test_that("returns a mapview object", {
+  map <- build_map(mk_native_detected_coord("1", "native"))
+  expect_s4_class(map, "mapview")
+})
+
+test_that("identical records in one cell collapse to a single point", {
+  nd <- mk_native_detected_coord(c("1", "2", "3"), rep("native", 3))
+  pts <- pts_of(build_map(nd))
+  expect_equal(nrow(pts), 1L)
+  expect_equal(pts, data.frame(X = 10, Y = 60), tolerance = 1e-9)
+})
+
+test_that("native_status splits records inside the same cell", {
+  nd <- mk_native_detected_coord(
+    c("1", "2", "3"),
+    c("native", "introduced", "location_doubtful")
+  )
+  pts <- pts_of(build_map(nd))
+  expect_equal(nrow(pts), 3L)
+  expect_equal(pts,
+               data.frame(X = c(10, 10, 10), Y = c(60, 60, 60)),
+               tolerance = 1e-9)
+})
+
+test_that("species splits records inside the same cell", {
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    name = c("Sp alpha", "Sp beta")
+  )
+  pts <- pts_of(build_map(nd))
+  expect_equal(nrow(pts), 2L)
+})
+
+test_that("records in different cells are not deduplicated", {
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    lon = c(10, 30),
+    lat = c(60, 30)
+  )
+  pts <- pts_of(build_map(nd))
+  expect_equal(nrow(pts), 2L)
+  expect_equal(pts, data.frame(X = c(10, 30), Y = c(60, 30)), tolerance = 1e-9)
+})
+
+test_that("unknown status records are excluded", {
+  nd <- mk_native_detected_coord(c("1", "2"), c("native", "unknown"))
+  pts <- pts_of(build_map(nd))
+  expect_equal(nrow(pts), 1L)
+  expect_equal(pts, data.frame(X = 10, Y = 60), tolerance = 1e-9)
+})
+
+test_that("species = 'all' keeps every species", {
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    name = c("Sp alpha", "Sp beta"),
+    lon = c(10, 30),
+    lat = c(60, 30)
+  )
+  expect_equal(nrow(pts_of(build_map(nd, species = "all"))), 2L)
+})
+
+test_that("species narrows the map to one name", {
+  nd <- mk_native_detected_coord(
+    c("1", "2", "3", "4"),
+    rep("native", 4),
+    name = c("Sp alpha", "Sp alpha", "Sp beta", "Sp beta"),
+    lon = c(10, 10, 30, 30),
+    lat = c(60, 60, 30, 30)
+  )
+  pts <- pts_of(build_map(nd, species = "Sp alpha"))
+  expect_equal(nrow(pts), 1L)
+  expect_equal(pts, data.frame(X = 10, Y = 60), tolerance = 1e-9)
+})
+
+test_that("species matching is exact, not a prefix or pattern", {
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    name = c("Sp alpha", "Sp alpha var. beta"),
+    lon = c(10, 30),
+    lat = c(60, 30)
+  )
+  expect_error(
+    map_records(native_detected_coord = nd, species = "Sp alp"),
+    "No record of `species`"
+  )
+})
+
+test_that("a species name that selects nothing is an error, not an empty map", {
+  # Silently rendering nothing would be read as "this species has no native
+  # records", so the name must be refused instead.
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    name = c("Sp alpha", "Sp beta")
+  )
+  expect_error(
+    map_records(native_detected_coord = nd, species = "No such species"),
+    "No record of `species`"
+  )
+})
+
+test_that("a name left empty by the unknown exclusion is an error too", {
+  # The name is present in the classification, but every one of its records is
+  # `unknown`, so nothing survives the exclusion. The guard therefore tests the
+  # selection after excluding unknowns, not whether the name exists.
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    c("unknown", "native"),
+    name = c("Sp only unknown", "Sp alpha")
+  )
+  expect_error(
+    map_records(native_detected_coord = nd, species = "Sp only unknown"),
+    "No record of `species`"
+  )
+})
+
+test_that("higher precision retains more points (finer cells)", {
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    lon = c(10, 10.01),
+    lat = c(60, 60.01)
+  )
+  expect_equal(nrow(pts_of(build_map(nd, precision = 3))), 1L)
+  expect_equal(nrow(pts_of(build_map(nd, precision = 6))), 2L)
+})
+
+test_that("first record of each group is the representative point", {
+  # No join is performed, so the row order of native_detected_coord is
+  # preserved and record "1" (at 10, 60) is the first row of the group.
+  nd <- mk_native_detected_coord(
+    c("1", "2"),
+    rep("native", 2),
+    lon = c(10, 10.01),
+    lat = c(60, 60.01)
+  )
+  pts <- pts_of(build_map(nd, precision = 3))
+  expect_equal(nrow(pts), 1L)
+  expect_equal(pts, data.frame(X = 10, Y = 60), tolerance = 1e-9)
+})
